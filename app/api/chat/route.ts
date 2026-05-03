@@ -27,38 +27,84 @@ function decideTools(query: string): ToolName[] {
   return tools
 }
 
-// -------------------- MCP CLIENT --------------------
+// -------------------- TOOLS (inline, no self-HTTP) --------------------
 
-async function callMCP(tool: string, query: string) {
-  try {
-    const res = await fetch("/api/mcp", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ tool, query }),
-    })
+const users = [
+  { id: 1, name: "John Doe", status: "active" },
+  { id: 2, name: "Alice Smith", status: "inactive" },
+  { id: 3, name: "Marcus Lee", status: "suspended" },
+]
 
-    // Read raw response first (important)
-    const text = await res.text()
+const logs = [
+  "ERROR: token expired at login",
+  "ERROR: database connection failed",
+  "WARN: missing environment variable",
+  "ERROR: rate limit exceeded on /api/auth",
+  "INFO: user session refreshed",
+]
 
-    let data
-
-    try {
-      data = JSON.parse(text)
-    } catch {
-      return `Invalid MCP response: ${text}`
-    }
-
-    // Always return actual MCP result if present
-    if (data && data.result !== undefined) {
-      return data.result
-    }
-
-    return "No result returned from MCP"
-  } catch (err) {
-    return "GitHub temporarily unavailable"
+async function callTool(tool: string, query: string): Promise<unknown> {
+  if (tool === "database") {
+    const match = query.match(/\d+/)
+    if (!match) return "User not found"
+    const id = parseInt(match[0], 10)
+    return users.find((u) => u.id === id) ?? "User not found"
   }
+
+  if (tool === "logs") {
+    const words = query.toLowerCase().split(/\s+/).filter(Boolean)
+    for (const word of words) {
+      const found = logs.find((l) => l.toLowerCase().includes(word))
+      if (found) return found
+    }
+    return "No logs found"
+  }
+
+  if (tool === "github") {
+    try {
+      const token = process.env.GITHUB_TOKEN
+      if (!token) return "GitHub unavailable: token not configured"
+      const url = `https://api.github.com/search/issues?q=${encodeURIComponent(query)}&per_page=3`
+      const res = await fetch(url, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/vnd.github+json",
+          "X-GitHub-Api-Version": "2022-11-28",
+        },
+        cache: "no-store",
+      })
+      if (!res.ok) return `GitHub error: ${res.status} ${res.statusText}`
+      const data = (await res.json()) as {
+        items?: {
+          title: string
+          html_url: string
+          body: string | null
+          repository_url: string
+        }[]
+      }
+      const items = data.items ?? []
+      if (items.length === 0) return "No relevant GitHub issues found"
+      const lines: string[] = ["Top GitHub issues:"]
+      for (const item of items.slice(0, 3)) {
+        const repoName =
+          item.repository_url.split("/repos/")[1] ?? "unknown/unknown"
+        const body = (item.body ?? item.title).replace(/\s+/g, " ").trim()
+        const snippet = body.length > 140 ? body.slice(0, 140) + "..." : body
+        lines.push(
+          `- ${item.title}`,
+          `  Repo: ${repoName}`,
+          `  ${item.html_url}`,
+          `  ${snippet}`
+        )
+      }
+      return lines.join("\n")
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      return `GitHub fetch failed: ${message}`
+    }
+  }
+
+  return "Unknown tool"
 }
 
 // -------------------- RESPONSE BUILDER --------------------
@@ -85,38 +131,32 @@ function isErrorString(v: unknown): boolean {
 function parseGitHubRefs(output: unknown): GitHubRef[] {
   if (typeof output !== "string") return []
   if (isErrorString(output)) return []
-  if (/^no github issues/i.test(output)) return []
+  if (/^no (relevant )?github issues/i.test(output)) return []
 
   const refs: GitHubRef[] = []
   const lines = output.split("\n").map((l) => l.trim())
-
   let current: Partial<GitHubRef> | null = null
 
   for (const line of lines) {
-    const titleMatch = line.match(/^-\s+(.+?)\s+\(repo:\s+(.+?)\)\s*$/)
-    if (titleMatch) {
-      if (current?.title && current.url) {
-        refs.push({
-          title: current.title,
-          repo: current.repo ?? "unknown",
-          url: current.url,
-        })
+    if (line.startsWith("- ")) {
+      if (current?.title && current?.url && current?.repo) {
+        refs.push(current as GitHubRef)
       }
-      current = { title: titleMatch[1], repo: titleMatch[2] }
+      current = { title: line.slice(2).trim() }
       continue
     }
-
+    if (current && line.startsWith("Repo:")) {
+      current.repo = line.replace("Repo:", "").trim()
+      continue
+    }
     if (current && /^https?:\/\//.test(line) && !current.url) {
       current.url = line
+      continue
     }
   }
 
-  if (current?.title && current.url) {
-    refs.push({
-      title: current.title,
-      repo: current.repo ?? "unknown",
-      url: current.url,
-    })
+  if (current?.title && current?.url && current?.repo) {
+    refs.push(current as GitHubRef)
   }
 
   return refs
@@ -335,11 +375,11 @@ export async function POST(request: NextRequest) {
 
   const tools = decideTools(query)
 
-  // EXECUTE TOOLS via MCP route
+  // EXECUTE TOOLS inline (no self-HTTP — Vercel functions can't call themselves)
   const results = await Promise.all(
     tools.map(async (tool) => ({
       tool,
-      output: await callMCP(tool, query),
+      output: await callTool(tool, query),
     }))
   )
 
